@@ -12,6 +12,9 @@
 // for convenience
 using json = nlohmann::json;
 
+const double latency = 0.1; // In seconds
+const double Lf = 2.67; 
+
 // For converting back and forth between radians and degrees.
 constexpr double pi() { return M_PI; }
 double deg2rad(double x) { return x * pi() / 180; }
@@ -65,6 +68,17 @@ Eigen::VectorXd polyfit(Eigen::VectorXd xvals, Eigen::VectorXd yvals,
   return result;
 }
 
+// This function converts the map coordinates to car coordinates 
+void transformCoords(Eigen::VectorXd &ptsx_car, Eigen::VectorXd &ptsy_car, double px, double py, double psi){
+  int total_size = ptsx_car.size();
+  for (int i = 0; i < total_size; i++) {
+    double x = ptsx_car[i] - px;
+    double y = ptsy_car[i] - py;
+    ptsx_car[i] = x * cos(0-psi) - y * sin(0-psi);
+    ptsy_car[i] = x * sin(0-psi) + y * cos(0-psi);
+  }
+}
+
 int main() {
   uWS::Hub h;
 
@@ -91,20 +105,52 @@ int main() {
           double py = j[1]["y"];
           double psi = j[1]["psi"];
           double v = j[1]["speed"];
+          
+          double steer_value = j[1]["steering_angle"];
+          double throttle_value = j[1]["throttle"];
 
-          /*
-          * TODO: Calculate steering angle and throttle using MPC.
-          *
-          * Both are in between [-1, 1].
-          *
-          */
-          double steer_value;
-          double throttle_value;
+          //Waypoint Transformation
+          //Waypoints need to be transformed from map coordinated to car coordinates
+	  Eigen::VectorXd ptsx_car = Eigen::VectorXd::Map(ptsx.data(), 6);
+	  Eigen::VectorXd ptsy_car = Eigen::VectorXd::Map(ptsy.data(), 6);
+
+          transformCoords(ptsx_car, ptsy_car, px, py, psi);
+
+          // Fitting polynomial to 3rd degree curve
+          auto coeffs = polyfit(ptsx_car, ptsy_car, 3);
+
+          // Cross Track Error: calculated by evaluating at polynomial at x, f(x)
+          double cte = polyeval(coeffs, 0);
+
+          // Due to the start at 0, the orientation error is -f'(x).
+          double epsi = -atan(coeffs[1]);
+         
+	  // To account for latency we'd predict the states till the defined
+	  // latency before sending them to MPC
+          // State Model          
+          double px_0 = 0.0 + v * cos (0.0) * latency;
+          double py_0 = 0.0 + v * sin (0.0) * latency;
+          double psi_0 = 0.0 - (v / Lf) * steer_value * latency;
+          double v_0 = v + throttle_value * latency;
+          double cte_0 = cte + v * sin(epsi) * latency;
+          double epsi_0 = epsi - (v / Lf) * steer_value * latency; 
+
+	  Eigen::VectorXd state(6);
+          // State initialization accounting for Global - Car transformation
+          state << px_0, py_0, psi_0, v_0, cte_0, epsi_0;
+
+          // Solve MPC
+          auto vars = mpc.Solve(state, coeffs);
+
+	  // Obtain steer and throttle values sent from Solve method
+          steer_value = vars[0];
+          throttle_value = vars[1];          
 
           json msgJson;
+
           // NOTE: Remember to divide by deg2rad(25) before you send the steering value back.
           // Otherwise the values will be in between [-deg2rad(25), deg2rad(25] instead of [-1, 1].
-          msgJson["steering_angle"] = steer_value;
+          msgJson["steering_angle"] = steer_value/(deg2rad(25));
           msgJson["throttle"] = throttle_value;
 
           //Display the MPC predicted trajectory 
@@ -113,6 +159,10 @@ int main() {
 
           //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
           // the points in the simulator are connected by a Green line
+          for (size_t i = 2; i < vars.size() - 1; i = i+2) {
+              mpc_x_vals.push_back(vars[i]);
+              mpc_y_vals.push_back(vars[i+1]);
+          }
 
           msgJson["mpc_x"] = mpc_x_vals;
           msgJson["mpc_y"] = mpc_y_vals;
@@ -123,10 +173,13 @@ int main() {
 
           //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
           // the points in the simulator are connected by a Yellow line
+          for (int i = 0; i < ptsx_car.size(); i++) {
+            next_x_vals.push_back(ptsx_car[i]);
+            next_y_vals.push_back(ptsy_car[i]);
+          }
 
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
-
 
           auto msg = "42[\"steer\"," + msgJson.dump() + "]";
           std::cout << msg << std::endl;
